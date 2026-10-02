@@ -33,17 +33,35 @@ from docx.oxml.ns import qn
 # Field sanitization
 # ----------------------------------------------------------------------------- #
 
-def clean_company(customer: str) -> str:
-    """Strip the account number(s) around the company name.
-    '519817 CUPE Ontario' -> 'CUPE Ontario'; also handles a number after a
-    colon and a trailing number, e.g. '519817 CUPE Ontario : 20260506' -> 'CUPE Ontario'."""
+def _strip_acct(s: str) -> str:
+    """Strip leading and trailing account numbers from a string."""
+    s = re.sub(r"^\s*\d+\s*", "", s)
+    s = re.sub(r"\s*\d+\s*$", "", s)
+    return re.sub(r"\s+", " ", s).strip(" :")
+
+
+def clean_company(customer: str, name_col: str = "") -> str:
+    """Extract the parent customer name.  Prefers the first colon-segment of the
+    Name column (Col A) which always has the parent customer, falling back to
+    the Customer column (Col B) when Col A is absent or unhelpful.
+
+    Col A pattern: '<code> Parent Customer : [<subcode> Sub Customer :] <date> Course...'
+    Col B pattern: '<code>[:<subcode>] Customer Name'
+    """
+    # Try Col A first — the first segment before a ' : ' is always the parent
+    a = (name_col or "").strip()
+    if " : " in a:
+        first_seg = a.split(" : ")[0].strip()
+        parent = _strip_acct(first_seg)
+        if parent:
+            return parent
+
+    # Fallback to Col B
     c = (customer or "").strip()
-    if ":" in c:                                   # keep the segment with letters
+    if ":" in c:
         segs = [s.strip() for s in c.split(":")]
         c = max(segs, key=lambda s: sum(ch.isalpha() for ch in s))
-    c = re.sub(r"^\s*\d+\s*", "", c)               # leading number
-    c = re.sub(r"\s*\d+\s*$", "", c)               # trailing number
-    return re.sub(r"\s+", " ", c).strip(" :")
+    return _strip_acct(c)
 
 
 def _strip_trailing_city(text: str, location: str) -> str:
@@ -680,6 +698,7 @@ H = {  # normalised header -> our key
     "time (from)": "tfrom", "time (to)": "tto", "instructors": "instructor",
     "participant names": "participants",
     "recertification participants": "recert_participants",
+    "on-site contact": "onsite_contact", "on-site phone": "onsite_phone",
 }
 
 
@@ -710,7 +729,7 @@ def _should_blank_instructor(name: str) -> bool:
 def build_one(rec, template_map, out_dir, sort_alpha=True, include_cancelled=False,
               fname_suffix=""):
     name_col = rec.get("name") or ""
-    company = clean_company(rec.get("customer"))
+    company = clean_company(rec.get("customer"), name_col)
 
     if not include_cancelled and "cancel" in name_col.lower():
         return ("skipped", "course marked CANCELLED", None, 0)
@@ -724,11 +743,17 @@ def build_one(rec, template_map, out_dir, sort_alpha=True, include_cancelled=Fal
     instructor_display = "" if _should_blank_instructor(instructor_raw) else instructor_raw
 
     contact_name = extract_contact_name(rec.get("contact"))
+    contact_str = format_contact(contact_name, rec.get("phone"))
+    onsite_name = extract_contact_name(rec.get("onsite_contact"))
+    onsite_phone = rec.get("onsite_phone")
+    if onsite_name:
+        onsite_str = format_contact(onsite_name, onsite_phone)
+        contact_str = f"{contact_str} / {onsite_str}" if contact_str else onsite_str
     info = {
         "Course Name": extract_course_name(name_col, rec.get("location")),
         "Company Name": company,
         "Location": extract_location(rec.get("location"), company, contact_name),
-        "Contact": format_contact(contact_name, rec.get("phone")),
+        "Contact": contact_str,
         "Date": format_dates(rec.get("start"), rec.get("other"), rec.get("end")),
         "Time": format_time(rec.get("tfrom"), rec.get("tto")),
         "Instructor": instructor_display,
@@ -755,7 +780,7 @@ def build_one(rec, template_map, out_dir, sort_alpha=True, include_cancelled=Fal
     fill_participants(doc, participants, flags)
 
     start_label = _fmt_single(_first_date(rec.get("start"), rec.get("other"), rec.get("end")))
-    instructor_fname = instructor_display or "Instructor"
+    instructor_fname = instructor_raw or "Instructor"
     parts = [p for p in (instructor_fname, start_label, company) if p]
     if fname_suffix:
         parts.append(fname_suffix)
@@ -785,14 +810,14 @@ def _assign_suffixes(rows):
         return extract_course_name(rec.get("name") or "", rec.get("location") or "")
 
     def _loc_key(rec):
-        company = clean_company(rec.get("customer"))
+        company = clean_company(rec.get("customer"), rec.get("name"))
         contact = extract_contact_name(rec.get("contact"))
         return extract_location(rec.get("location"), company, contact)
 
     # group by (company, date)
     groups = defaultdict(list)
     for i, rec in enumerate(rows):
-        company = clean_company(rec.get("customer"))
+        company = clean_company(rec.get("customer"), rec.get("name"))
         key = (company.lower(), _date_key(rec))
         groups[key].append(i)
 
